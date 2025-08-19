@@ -18,13 +18,24 @@ BTRFS_OPTS_DEFAULT="rw,noatime,ssd,compress=zstd,space_cache,commit=120"
 die() { echo "ERROR: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
 yn() { read -rp "$1 [y/N]: " _a; [[ "${_a:-}" =~ ^[Yy]$ ]]; }
+to_mib() {
+  local s="${1^^}"
+  if [[ "$s" =~ ^([0-9]+)MIB$ ]]; then echo "${BASH_REMATCH[1]}";
+  elif [[ "$s" =~ ^([0-9]+)GIB$ ]]; then echo $(( ${BASH_REMATCH[1]} * 1024 ));
+  elif [[ "$s" =~ ^([0-9]+)MB$ ]]; then awk -v n="${BASH_REMATCH[1]}" 'BEGIN{printf "%d", n*1000/1024}';
+  elif [[ "$s" =~ ^([0-9]+)GB$ ]]; then echo $(( ${BASH_REMATCH[1]} * 1000 * 1000 / 1024 ));
+  else die "Unsupported size: $1"; fi
+}
+wait_for() {
+  local path="$1" tries=40; while ! [[ -e "$path" ]]; do sleep 0.1; tries=$((tries-1)); [[ $tries -le 0 ]] && die "Timed out waiting for $path"; done
+}
 
 usage() {
   cat <<EOF
 Usage: $0 --disk /dev/sdX [options]
   --disk DEVICE
-  --efi-size SIZE      (e.g., 200MiB, 1GiB)
-  --boot-size SIZE     (e.g., 500MiB, 1GiB)
+  --efi-size SIZE
+  --boot-size SIZE
   --hostname NAME
   --arch x86_64|x86_64-musl
   --repo URL
@@ -32,21 +43,6 @@ Usage: $0 --disk /dev/sdX [options]
   --force
   --help
 EOF
-}
-
-to_mib() {
-  local s="${1^^}"
-  if [[ "$s" =~ ^([0-9]+)MIB$ ]]; then
-    echo "${BASH_REMATCH[1]}"
-  elif [[ "$s" =~ ^([0-9]+)GIB$ ]]; then
-    echo $(( ${BASH_REMATCH[1]} * 1024 ))
-  elif [[ "$s" =~ ^([0-9]+)MB$ ]]; then
-    awk -v n="${BASH_REMATCH[1]}" 'BEGIN{printf "%d", n*1000/1024}'
-  elif [[ "$s" =~ ^([0-9]+)GB$ ]]; then
-    echo $(( ${BASH_REMATCH[1]} * 1000 * 1000 / 1024 ))
-  else
-    die "Unsupported size: $1 (use MiB/GiB/MB/GB)"
-  fi
 }
 
 while [[ $# -gt 0 ]]; do
@@ -65,16 +61,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -b "${DISK:-}" ]] || { usage; die "--disk is required and must be a block device"; }
+if [[ "$USE_MUSL" == "yes" ]]; then ARCH="x86_64-musl"; REPO="${REPO%/}/musl"; fi
 
-if [[ "$USE_MUSL" == "yes" ]]; then
-  ARCH="x86_64-musl"
-  REPO="${REPO%/}/musl"
-fi
-
-for cmd in parted mkfs.vfat mkfs.ext2 cryptsetup mkfs.btrfs lsblk xbps-install chroot grub-install grub-mkconfig awk; do
-  need "$cmd"
-done
-
+for cmd in parted mkfs.vfat mkfs.ext2 cryptsetup mkfs.btrfs lsblk xbps-install chroot grub-install grub-mkconfig awk wipefs udevadm findmnt; do need "$cmd"; done
 [[ -z "$(mount | grep -E "^${DISK}[p0-9]*")" ]] || die "Some partitions on $DISK are mounted; unmount them first."
 
 EFI_MIB="$(to_mib "$EFI_SIZE")"
@@ -87,32 +76,26 @@ END_BOOT=$(( START_BOOT + BOOT_MIB ))
 echo ">>> Planned actions on $DISK"
 echo "    GPT: [1] EFI ${EFI_MIB}MiB  [2] /boot ${BOOT_MIB}MiB  [3] LUKS+btrfs root (rest)"
 lsblk -dno NAME,SIZE,MODEL "$DISK" || true
-
-if [[ "$FORCE" != "yes" ]]; then
-  yn "This will destroy all data on $DISK. Continue?" || exit 1
-fi
+if [[ "$FORCE" != "yes" ]]; then yn "This will destroy all data on $DISK. Continue?" || exit 1; fi
 
 parted -s "$DISK" mklabel gpt
 parted -s "$DISK" mkpart ESP fat32 "${START_EFI}MiB" "${END_EFI}MiB"
 parted -s "$DISK" set 1 esp on
 parted -s "$DISK" mkpart boot ext2 "${START_BOOT}MiB" "${END_BOOT}MiB"
 parted -s "$DISK" mkpart root btrfs "${END_BOOT}MiB" 100%
+udevadm settle
 
-if [[ "$DISK" =~ nvme ]]; then
-  P1="${DISK}p1"; P2="${DISK}p2"; P3="${DISK}p3"
-else
-  P1="${DISK}1"; P2="${DISK}2"; P3="${DISK}3"
-fi
-
-sleep 1
-udevadm settle || true
+if [[ "$DISK" =~ nvme ]]; then P1="${DISK}p1"; P2="${DISK}p2"; P3="${DISK}p3"; else P1="${DISK}1"; P2="${DISK}2"; P3="${DISK}3"; fi
 
 mkfs.vfat -n "$EFI_LABEL" -F32 "$P1"
 mkfs.ext2 -L "$BOOT_LABEL" "$P2"
 
 cryptsetup luksFormat --type luks2 -s 512 "$P3"
 cryptsetup open "$P3" "$LUKS_NAME"
-mkfs.btrfs -L "$BTRFS_LABEL" "/dev/mapper/${LUKS_NAME}"
+wait_for "/dev/mapper/${LUKS_NAME}"
+udevadm settle
+wipefs -a "/dev/mapper/${LUKS_NAME}" || true
+mkfs.btrfs -f -L "$BTRFS_LABEL" "/dev/mapper/${LUKS_NAME}"
 
 BTRFS_OPTS="${BTRFS_OPTS_DEFAULT}"
 
@@ -142,23 +125,15 @@ mount -o rw,noatime "$P2" /mnt/boot
 export XBPS_ARCH="$ARCH"
 xbps-install -S -R "$REPO" -r /mnt base-system btrfs-progs cryptsetup e2fsprogs util-linux
 
-for dir in dev proc sys run; do
-  mount --rbind "/$dir" "/mnt/$dir"
-  mount --make-rslave "/mnt/$dir"
-done
+for dir in dev proc sys run; do mount --rbind "/$dir" "/mnt/$dir"; mount --make-rslave "/mnt/$dir"; done
 cp -f /etc/resolv.conf /mnt/etc/resolv.conf
 
 cat >/mnt/root/post-chroot.sh <<'CHROOT_SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
-: "${HOSTNAME:?}"
-: "${BTRFS_OPTS:?}"
-: "${EFI_PART:?}"
-: "${BOOT_PART:?}"
-: "${LUKS_NAME:?}"
+: "${HOSTNAME:?}"; : "${BTRFS_OPTS:?}"; : "${EFI_PART:?}"; : "${BOOT_PART:?}"; : "${LUKS_NAME:?}"
 
 echo "${HOSTNAME}" >/etc/hostname
-
 if [[ ! -f /etc/rc.conf ]]; then
   cat >/etc/rc.conf <<EOF
 HARDWARECLOCK="UTC"
@@ -178,9 +153,9 @@ fi
 
 passwd
 
-UEFI_UUID=$(blkid -s UUID -o value "${EFI_PART}")
-BOOT_UUID=$(blkid -s UUID -o value "${BOOT_PART}")
-ROOT_UUID=$(blkid -s UUID -o value "/dev/mapper/${LUKS_NAME}")
+UEFI_UUID=$(findmnt -no UUID /efi || true)
+BOOT_UUID=$(findmnt -no UUID /boot || true)
+ROOT_UUID=$(findmnt -no UUID / || true)
 
 cat >/etc/fstab <<EOF
 UUID=${ROOT_UUID} / btrfs ${BTRFS_OPTS},subvol=@ 0 1
@@ -213,14 +188,19 @@ dd if=/dev/zero of=/var/swap/swapfile bs=1G count=16 status=progress
 mkswap /var/swap/swapfile
 swapon /var/swap/swapfile
 
-RESUME_OFFSET="$(filefrag -v /var/swap/swapfile | awk '/^ *0:/{print $4}' | sed 's/\.\.//;s/[^0-9].*$//')"
-ROOT_UUID=$(blkid -s UUID -o value "/dev/mapper/${LUKS_NAME}")
+if btrfs inspect-internal map-swapfile -r /var/swap/swapfile >/tmp/resume 2>/dev/null; then
+  RESUME_OFFSET="$(awk '/^file offset:/ {print $3}' /tmp/resume | head -n1)"
+else
+  RESUME_OFFSET="$(filefrag -v /var/swap/swapfile | awk '/^ *0:/{print $4}' | sed 's/\.\.//;s/[^0-9].*$//')"
+fi
+
+ROOT_UUID=$(findmnt -no UUID / || true)
 sed -i '/^GRUB_CMDLINE_LINUX=/d' /etc/default/grub 2>/dev/null || true
-if [[ -n "${RESUME_OFFSET:-}" ]]; then
+if [[ -n "${RESUME_OFFSET:-}" && -n "${ROOT_UUID:-}" ]]; then
   echo "GRUB_CMDLINE_LINUX=\"resume=UUID=${ROOT_UUID} resume_offset=${RESUME_OFFSET}\"" >> /etc/default/grub
 fi
 
-xbps-install -y xorg-minimal xfce4 xfce4-terminal gdm dbus elogind polkit
+xbps-install -y xorg-minimal mesa-dri xfce4 xfce4-terminal gdm dbus elogind polkit
 ln -snf /etc/sv/dbus /var/service/dbus || true
 ln -snf /etc/sv/elogind /var/service/elogind || true
 ln -snf /etc/sv/gdm /var/service/gdm || true

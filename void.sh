@@ -23,8 +23,8 @@ usage() {
   cat <<EOF
 Usage: $0 --disk /dev/sdX [options]
   --disk DEVICE
-  --efi-size SIZE
-  --boot-size SIZE
+  --efi-size SIZE      (e.g., 200MiB, 1GiB)
+  --boot-size SIZE     (e.g., 500MiB, 1GiB)
   --hostname NAME
   --arch x86_64|x86_64-musl
   --repo URL
@@ -32,6 +32,21 @@ Usage: $0 --disk /dev/sdX [options]
   --force
   --help
 EOF
+}
+
+to_mib() {
+  local s="${1^^}"
+  if [[ "$s" =~ ^([0-9]+)MIB$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  elif [[ "$s" =~ ^([0-9]+)GIB$ ]]; then
+    echo $(( ${BASH_REMATCH[1]} * 1024 ))
+  elif [[ "$s" =~ ^([0-9]+)MB$ ]]; then
+    awk -v n="${BASH_REMATCH[1]}" 'BEGIN{printf "%d", n*1000/1024}'
+  elif [[ "$s" =~ ^([0-9]+)GB$ ]]; then
+    echo $(( ${BASH_REMATCH[1]} * 1000 * 1000 / 1024 ))
+  else
+    die "Unsupported size: $1 (use MiB/GiB/MB/GB)"
+  fi
 }
 
 while [[ $# -gt 0 ]]; do
@@ -56,14 +71,21 @@ if [[ "$USE_MUSL" == "yes" ]]; then
   REPO="${REPO%/}/musl"
 fi
 
-for cmd in parted mkfs.vfat mkfs.ext2 cryptsetup mkfs.btrfs lsblk xbps-install chroot grub-install grub-mkconfig; do
+for cmd in parted mkfs.vfat mkfs.ext2 cryptsetup mkfs.btrfs lsblk xbps-install chroot grub-install grub-mkconfig awk; do
   need "$cmd"
 done
 
 [[ -z "$(mount | grep -E "^${DISK}[p0-9]*")" ]] || die "Some partitions on $DISK are mounted; unmount them first."
 
+EFI_MIB="$(to_mib "$EFI_SIZE")"
+BOOT_MIB="$(to_mib "$BOOT_SIZE")"
+START_EFI=1
+END_EFI=$(( START_EFI + EFI_MIB ))
+START_BOOT=$(( END_EFI + 1 ))
+END_BOOT=$(( START_BOOT + BOOT_MIB ))
+
 echo ">>> Planned actions on $DISK"
-echo "    • GPT: [1] EFI ${EFI_SIZE}  [2] /boot ${BOOT_SIZE}  [3] LUKS+btrfs root (rest)"
+echo "    GPT: [1] EFI ${EFI_MIB}MiB  [2] /boot ${BOOT_MIB}MiB  [3] LUKS+btrfs root (rest)"
 lsblk -dno NAME,SIZE,MODEL "$DISK" || true
 
 if [[ "$FORCE" != "yes" ]]; then
@@ -71,16 +93,10 @@ if [[ "$FORCE" != "yes" ]]; then
 fi
 
 parted -s "$DISK" mklabel gpt
-START_EFI="1MiB"
-END_EFI="$EFI_SIZE"
-START_BOOT="$END_EFI"
-END_BOOT="$(printf "%s + %s\n" "$END_EFI" "$BOOT_SIZE" | awk '{print $1$2$3}')"
-
-parted -s "$DISK" \
-  mkpart ESP fat32 "$START_EFI" "$END_EFI" \
-  set 1 esp on \
-  mkpart boot ext2 "$START_BOOT" "$END_BOOT" \
-  mkpart root btrfs "$END_BOOT" 100%
+parted -s "$DISK" mkpart ESP fat32 "${START_EFI}MiB" "${END_EFI}MiB"
+parted -s "$DISK" set 1 esp on
+parted -s "$DISK" mkpart boot ext2 "${START_BOOT}MiB" "${END_BOOT}MiB"
+parted -s "$DISK" mkpart root btrfs "${END_BOOT}MiB" 100%
 
 if [[ "$DISK" =~ nvme ]]; then
   P1="${DISK}p1"; P2="${DISK}p2"; P3="${DISK}p3"
@@ -232,5 +248,4 @@ env -i \
 umount -R /mnt || true
 swapoff -a || true
 cryptsetup close "$LUKS_NAME" || true
-sleep 2
 shutdown -r now
